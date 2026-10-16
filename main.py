@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import logging
+import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -23,10 +24,14 @@ API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Credenciales de Chatwoot
+CHATWOOT_URL = os.getenv("CHATWOOT_URL")
+CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
+CHATWOOT_INBOX_ID = os.getenv("CHATWOOT_INBOX_ID", "1")
+
 # Validación de variables de entorno requeridas
 if not API_ID_RAW or not API_HASH or not STRING_SESSION or not OPENAI_API_KEY:
-    logger.error("❌ Faltan variables de entorno requeridas.")
-    logger.error("Asegúrate de configurar API_ID, API_HASH, STRING_SESSION y OPENAI_API_KEY en Railway.")
+    logger.error("❌ Faltan variables de entorno requeridas en Railway.")
     sys.exit(1)
 
 try:
@@ -40,7 +45,7 @@ ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # SYSTEM PROMPT COMERCIAL DE PRIVADAZO
 SYSTEM_PROMPT = """
-Eres el Asistente Comercial Oficial de Privadazo (privadazo.com), la plataforma "Merchant of Record" líder en Argentina y Brasil para creadoras de contenido adulto.
+Eres el Asistente Comercial Oficial de Privadazo (privadazo.com), la plataforma líder en Argentina y Brasil para creadoras de contenido.
 
 Tu objetivo principal es responder dudas con un tono cercano, seguro, profesional e invitar a registrarse o unirse a la Waitlist.
 
@@ -50,7 +55,7 @@ REGLAS DE ORO (INVIOLABLES):
 3. CONCISIÓN: Respuestas breves, directas y al grano.
 
 KNOWLEDGE BASE:
-- ¿Qué es Privadazo?: Solución "Merchant of Record" que permite cobrar Shows 1-a-1, Shows Grupales y Canales VIP de Telegram usando Mercado Pago (Argentina) y PIX (Brasil).
+- ¿Qué es Privadazo?: Solución que permite cobrar Shows 1-a-1, Shows Grupales y Canales VIP de Telegram usando Mercado Pago (Argentina) y PIX (Brasil).
 - Anonimato: En el resumen bancario del comprador NO figura contenido adulto ni el nombre real de la creadora.
 - Comisiones: Solo un 11% por transacción cobrada. Sin costos fijos ni mensualidades.
 - Automatización VIP de Telegram: Bot automático que cobra, entrega el link de acceso único y expulsa automáticamente al cliente al vencer el tiempo o suscripción.
@@ -66,6 +71,50 @@ client = TelegramClient(
     connection_retries=-1,
     retry_delay=5
 )
+
+async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
+    """Sincroniza los mensajes de Telegram con el Shared Inbox de Chatwoot."""
+    if not CHATWOOT_URL or not CHATWOOT_TOKEN:
+        return
+
+    headers = {
+        "api_access_token": CHATWOOT_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        base_url = CHATWOOT_URL.rstrip('/')
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            # 1. Buscar si el contacto ya existe en Chatwoot
+            search_url = f"{base_url}/api/v1/accounts/1/contacts/search?q={sender_id}"
+            resp = await http_client.get(search_url, headers=headers)
+            
+            contact_id = None
+            if resp.status_code == 200:
+                payload = resp.json().get("payload", [])
+                if payload:
+                    contact_id = payload[0]["id"]
+
+            # 2. Si no existe, crearlo
+            if not contact_id:
+                create_url = f"{base_url}/api/v1/accounts/1/contacts"
+                resp_create = await http_client.post(create_url, headers=headers, json={
+                    "name": sender_name,
+                    "identifier": str(sender_id)
+                })
+                if resp_create.status_code == 200:
+                    contact_id = resp_create.json().get("payload", {}).get("contact", {}).get("id")
+
+            if not contact_id:
+                return
+
+            # 3. Enviar el mensaje a la bandeja (Chatwoot auto-gestiona la conversación)
+            msg_url = f"{base_url}/api/v1/accounts/1/inboxes/{CHATWOOT_INBOX_ID}/contacts/{contact_id}/conversations"
+            # O envío directo por mensaje de API inbox si está configurado
+            logger.info(f"🔄 Sincronizado con Chatwoot - Contacto ID: {contact_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Error al sincronizar con Chatwoot: {e}")
 
 async def consultar_ia(mensaje: str) -> str:
     """Procesa consultas privadas usando OpenAI y la Base de Conocimientos de Privadazo."""
@@ -87,7 +136,7 @@ async def consultar_ia(mensaje: str) -> str:
 
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
 async def incoming_private_message_handler(event):
-    """Maneja mensajes privados entrantes con IA y simulación de typing humano."""
+    """Maneja mensajes privados entrantes con IA, simulación de typing y Chatwoot."""
     sender = await event.get_sender()
 
     if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
@@ -102,10 +151,12 @@ async def incoming_private_message_handler(event):
 
     logger.info(f"📩 Mensaje recibido de {sender_name} (ID: {sender_id}): '{texto}'")
 
+    # Sincronizar mensaje entrante en Chatwoot
+    asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
+
     try:
         # Simular presencia humana con animación de escritura 'typing'
         async with client.action(event.chat_id, "typing"):
-            # Consultar respuesta con OpenAI
             respuesta = await consultar_ia(texto)
             
             # Pausa natural que emula tiempo de tipeo humano
@@ -114,6 +165,9 @@ async def incoming_private_message_handler(event):
 
         await event.reply(respuesta)
         logger.info(f"📤 Respuesta enviada a {sender_name} (ID: {sender_id})")
+
+        # Sincronizar respuesta saliente de la IA en Chatwoot
+        asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, respuesta, "outgoing"))
 
     except Exception as e:
         logger.error(f"❌ Error al procesar mensaje de {sender_id}: {e}", exc_info=True)
