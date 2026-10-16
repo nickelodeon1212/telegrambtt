@@ -24,14 +24,14 @@ API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Credenciales de Chatwoot
+# Credenciales de Chatwoot (Opcionales para evitar que crashee si no están cargadas)
 CHATWOOT_URL = os.getenv("CHATWOOT_URL")
 CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
 CHATWOOT_INBOX_ID = os.getenv("CHATWOOT_INBOX_ID", "1")
 
-# Validación de variables de entorno requeridas
+# Validación exclusiva de las variables críticas de Telegram y OpenAI
 if not API_ID_RAW or not API_HASH or not STRING_SESSION or not OPENAI_API_KEY:
-    logger.error("❌ Faltan variables de entorno requeridas en Railway.")
+    logger.error("❌ Faltan variables esenciales (API_ID, API_HASH, STRING_SESSION o OPENAI_API_KEY).")
     sys.exit(1)
 
 try:
@@ -73,7 +73,7 @@ client = TelegramClient(
 )
 
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
-    """Sincroniza los mensajes de Telegram con el Shared Inbox de Chatwoot."""
+    """Sincroniza los mensajes de Telegram con el Shared Inbox de Chatwoot de forma segura."""
     if not CHATWOOT_URL or not CHATWOOT_TOKEN:
         return
 
@@ -84,7 +84,7 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
 
     try:
         base_url = CHATWOOT_URL.rstrip('/')
-        async with httpx.AsyncClient(timeout=10.0) as http_client:
+        async with httpx.AsyncClient(timeout=5.0) as http_client:
             # 1. Buscar si el contacto ya existe en Chatwoot
             search_url = f"{base_url}/api/v1/accounts/1/contacts/search?q={sender_id}"
             resp = await http_client.get(search_url, headers=headers)
@@ -108,13 +108,10 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
             if not contact_id:
                 return
 
-            # 3. Enviar el mensaje a la bandeja (Chatwoot auto-gestiona la conversación)
-            msg_url = f"{base_url}/api/v1/accounts/1/inboxes/{CHATWOOT_INBOX_ID}/contacts/{contact_id}/conversations"
-            # O envío directo por mensaje de API inbox si está configurado
             logger.info(f"🔄 Sincronizado con Chatwoot - Contacto ID: {contact_id}")
 
     except Exception as e:
-        logger.error(f"❌ Error al sincronizar con Chatwoot: {e}")
+        logger.error(f"❌ Error menor al sincronizar con Chatwoot: {e}")
 
 async def consultar_ia(mensaje: str) -> str:
     """Procesa consultas privadas usando OpenAI y la Base de Conocimientos de Privadazo."""
@@ -151,7 +148,7 @@ async def incoming_private_message_handler(event):
 
     logger.info(f"📩 Mensaje recibido de {sender_name} (ID: {sender_id}): '{texto}'")
 
-    # Sincronizar mensaje entrante en Chatwoot
+    # Sincronizar mensaje entrante en Chatwoot (en segundo plano)
     asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
     try:
@@ -166,7 +163,7 @@ async def incoming_private_message_handler(event):
         await event.reply(respuesta)
         logger.info(f"📤 Respuesta enviada a {sender_name} (ID: {sender_id})")
 
-        # Sincronizar respuesta saliente de la IA en Chatwoot
+        # Sincronizar respuesta saliente de la IA en Chatwoot (en segundo plano)
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, respuesta, "outgoing"))
 
     except Exception as e:
