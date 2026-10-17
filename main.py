@@ -8,6 +8,8 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import RPCError
 from openai import OpenAI
+from fastapi import FastAPI, Request, BackgroundTasks
+import uvicorn
 
 # Configuración de logs formateados
 logging.basicConfig(
@@ -24,12 +26,14 @@ API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Credenciales de Chatwoot (Opcionales para evitar que crashee si no están cargadas)
+# Credenciales de Chatwoot
 CHATWOOT_URL = os.getenv("CHATWOOT_URL")
 CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
 CHATWOOT_INBOX_ID = os.getenv("CHATWOOT_INBOX_ID", "1")
 
-# Validación exclusiva de las variables críticas de Telegram y OpenAI
+# Puerto para el servidor FastAPI (Railway asigna PORT automáticamente)
+PORT = int(os.getenv("PORT", 8080))
+
 if not API_ID_RAW or not API_HASH or not STRING_SESSION or not OPENAI_API_KEY:
     logger.error("❌ Faltan variables esenciales (API_ID, API_HASH, STRING_SESSION o OPENAI_API_KEY).")
     sys.exit(1)
@@ -40,10 +44,14 @@ except ValueError:
     logger.error("❌ API_ID debe ser un valor numérico entero.")
     sys.exit(1)
 
-# Inicializar cliente de OpenAI
+# Inicializar clientes
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI()
 
-# SYSTEM PROMPT COMERCIAL DE PRIVADAZO
+# Registro en memoria para pausar la IA cuando un humano interviene desde Chatwoot
+# Diccionario: { sender_id (int): True }
+HUMAN_PAUSED_USERS = {}
+
 SYSTEM_PROMPT = """
 Eres el Asistente Comercial Oficial de Privadazo (privadazo.com), la plataforma líder en Argentina y Brasil para creadoras de contenido.
 
@@ -62,7 +70,6 @@ KNOWLEDGE BASE:
 - Registro: Acceso anticipado vía Waitlist en privadazo.com.
 """
 
-# Inicializar cliente Userbot con StringSession
 client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
@@ -72,8 +79,12 @@ client = TelegramClient(
     retry_delay=5
 )
 
+# ==========================================
+# FUNCIONES DE HELPER PARA CHATWOOT
+# ==========================================
+
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
-    """Sincroniza los mensajes de Telegram con el Shared Inbox de Chatwoot de forma completa."""
+    """Sincroniza mensajes agrupando todo en un único hilo de conversación activa por contacto."""
     if not CHATWOOT_URL or not CHATWOOT_TOKEN:
         return
 
@@ -85,7 +96,7 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
     try:
         base_url = CHATWOOT_URL.rstrip('/')
         async with httpx.AsyncClient(timeout=10.0) as http_client:
-            # 1. Buscar si el contacto ya existe en Chatwoot
+            # 1. Buscar o crear el contacto
             search_url = f"{base_url}/api/v1/accounts/1/contacts/search?q={sender_id}"
             resp = await http_client.get(search_url, headers=headers)
             
@@ -95,7 +106,6 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
                 if payload:
                     contact_id = payload[0]["id"]
 
-            # 2. Si no existe, crearlo
             if not contact_id:
                 create_url = f"{base_url}/api/v1/accounts/1/contacts"
                 resp_create = await http_client.post(create_url, headers=headers, json={
@@ -108,45 +118,46 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
             if not contact_id:
                 return
 
-            # 3. Crear o buscar la conversación activa para este contacto en el Inbox
-            conv_url = f"{base_url}/api/v1/accounts/1/conversations"
-            resp_conv = await http_client.post(conv_url, headers=headers, json={
-                "inbox_id": int(CHATWOOT_INBOX_ID),
-                "contact_id": contact_id,
-                "source_id": str(sender_id)
-            })
+            # 2. Buscar si ya existe una conversación abierta para este contacto
+            list_conv_url = f"{base_url}/api/v1/accounts/1/contacts/{contact_id}/conversations"
+            resp_list = await http_client.get(list_conv_url, headers=headers)
             
             conversation_id = None
-            if resp_conv.status_code in [200, 201]:
-                conv_data = resp_conv.json()
-                conversation_id = conv_data.get("id")
+            if resp_list.status_code == 200:
+                convs = resp_list.json().get("payload", [])
+                for conv in convs:
+                    if conv.get("status") in ["open", "pending"]:
+                        conversation_id = conv.get("id")
+                        break
 
-            # Si la conversación ya existía, la buscamos
+            # 3. Si no existe conversación abierta, se crea una sola vez
             if not conversation_id:
-                list_conv_url = f"{base_url}/api/v1/accounts/1/contacts/{contact_id}/conversations"
-                resp_list = await http_client.get(list_conv_url, headers=headers)
-                if resp_list.status_code == 200:
-                    convs = resp_list.json().get("payload", [])
-                    if convs:
-                        conversation_id = convs[0]["id"]
+                conv_url = f"{base_url}/api/v1/accounts/1/conversations"
+                resp_conv = await http_client.post(conv_url, headers=headers, json={
+                    "inbox_id": int(CHATWOOT_INBOX_ID),
+                    "contact_id": contact_id
+                })
+                if resp_conv.status_code in [200, 201]:
+                    conversation_id = resp_conv.json().get("id")
 
             if not conversation_id:
                 return
 
-            # 4. Enviar el mensaje dentro de la conversación
+            # 4. Enviar el mensaje a la conversación unificada
             msg_url = f"{base_url}/api/v1/accounts/1/conversations/{conversation_id}/messages"
             await http_client.post(msg_url, headers=headers, json={
                 "content": message_text,
-                "message_type": message_type  # 'incoming' para usuario, 'outgoing' para el bot
+                "message_type": message_type,
+                "private": False
             })
 
-            logger.info(f"✅ Mensaje sincronizado en Chatwoot (Conversación ID: {conversation_id})")
+            logger.info(f"✅ Sincronizado en Chatwoot (Conversación ID {conversation_id})")
 
     except Exception as e:
-        logger.error(f"❌ Error al sincronizar mensaje en Chatwoot: {e}")
+        logger.error(f"❌ Error al sincronizar con Chatwoot: {e}")
 
 async def consultar_ia(mensaje: str) -> str:
-    """Procesa consultas privadas usando OpenAI y la Base de Conocimientos de Privadazo."""
+    """Procesa consultas privadas usando OpenAI."""
     try:
         response = await asyncio.to_thread(
             ai_client.chat.completions.create,
@@ -163,9 +174,58 @@ async def consultar_ia(mensaje: str) -> str:
         logger.error(f"❌ Error consultando la IA: {e}")
         return "¡Hola! Estoy experimentando una breve interrupción. Por favor escríbeme de nuevo en un instante."
 
+# ==========================================
+# ENDPOINT WEBHOOK (CHATWOOT -> TELEGRAM)
+# ==========================================
+
+@app.post("/webhook/chatwoot")
+async def chatwoot_webhook(request: Request):
+    """Escucha eventos de Chatwoot. Si un agente humano escribe, manda el mensaje a Telegram."""
+    try:
+        data = await request.json()
+        event_type = data.get("event")
+
+        if event_type == "message_created":
+            message_type = data.get("message_type")
+            is_private = data.get("private", False)
+
+            # Nos interesan respuestas humanas salientes que no sean notas privadas
+            if message_type == "outgoing" and not is_private:
+                # Verificar si el mensaje fue enviado por un agente (no por la API/bot)
+                sender_type = data.get("sender", {}).get("type")
+                
+                if sender_type == "user":  # 'user' en Chatwoot es el agente humano
+                    content = data.get("content", "")
+                    meta = data.get("conversation", {}).get("meta", {})
+                    sender_identifier = meta.get("sender", {}).get("identifier")
+
+                    if sender_identifier and content:
+                        telegram_user_id = int(sender_identifier)
+                        
+                        # Pausar la IA automáticamente para dar control total al humano
+                        HUMAN_PAUSED_USERS[telegram_user_id] = True
+                        logger.info(f"⏸️ IA pausada para el usuario {telegram_user_id} por intervención humana.")
+
+                        # Enviar el mensaje a Telegram usando Telethon
+                        await client.send_message(telegram_user_id, content)
+                        logger.info(f"💬 Mensaje manual enviado a Telegram ID {telegram_user_id}: '{content}'")
+
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"❌ Error procesando Webhook de Chatwoot: {e}")
+        return {"status": "error", "detail": str(e)}
+
+@app.get("/")
+async def health_check():
+    return {"status": "online", "service": "Privadazo Userbot"}
+
+# ==========================================
+# EVENT HANDLER DE TELEGRAM
+# ==========================================
+
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
 async def incoming_private_message_handler(event):
-    """Maneja mensajes privados entrantes con IA, simulación de typing y Chatwoot."""
+    """Maneja mensajes de Telegram, consulta IA si aplica y sincroniza con Chatwoot."""
     sender = await event.get_sender()
 
     if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
@@ -180,31 +240,42 @@ async def incoming_private_message_handler(event):
 
     logger.info(f"📩 Mensaje recibido de {sender_name} (ID: {sender_id}): '{texto}'")
 
-    # Sincronizar mensaje entrante en Chatwoot (en segundo plano)
+    # Sincronizar mensaje entrante en Chatwoot
     asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
+    # Si la IA está pausada para este usuario por intervención humana, no responde OpenAI
+    if HUMAN_PAUSED_USERS.get(sender_id, False):
+        logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
+        return
+
     try:
-        # Simular presencia humana con animación de escritura 'typing'
         async with client.action(event.chat_id, "typing"):
             respuesta = await consultar_ia(texto)
-            
-            # Pausa natural que emula tiempo de tipeo humano
             delay_tipeo = min(len(respuesta) * 0.03, 4.0)
             await asyncio.sleep(max(1.5, delay_tipeo))
 
         await event.reply(respuesta)
-        logger.info(f"📤 Respuesta enviada a {sender_name} (ID: {sender_id})")
+        logger.info(f"📤 Respuesta IA enviada a {sender_name} (ID: {sender_id})")
 
-        # Sincronizar respuesta saliente de la IA en Chatwoot (en segundo plano)
+        # Sincronizar respuesta saliente en Chatwoot
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, respuesta, "outgoing"))
 
     except Exception as e:
-        logger.error(f"❌ Error al procesar mensaje de {sender_id}: {e}", exc_info=True)
+        logger.error(f"❌ Error procesando mensaje de {sender_id}: {e}", exc_info=True)
+
+# ==========================================
+# INICIO CONJUNTO (FASTAPI + TELETHON)
+# ==========================================
 
 async def main():
     print("=" * 60)
-    print("🤖 Iniciando Userbot Asistente de Privadazo...")
+    print("🤖 Iniciando Userbot + Webhook Server de Privadazo...")
     print("=" * 60)
+
+    # Iniciar servidor web FastAPI en segundo plano
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")
+    server = uvicorn.Server(config)
+    asyncio.create_task(server.serve())
 
     retry_delay = 5
 
@@ -219,12 +290,12 @@ async def main():
             me = await client.get_me()
 
             print("\n" + "=" * 60)
-            print("✅ ¡Userbot de Privadazo autenticado y escuchando!")
+            print("✅ ¡Userbot y Servidor Web escuchando correctamente!")
             print(f"👉 Cuenta: {me.first_name} {getattr(me, 'last_name', '') or ''}".strip())
             print(f"👉 Username: @{me.username or 'sin_username'}")
             print(f"👉 ID: {me.id}")
+            print(f"👉 Webhook URL: https://<tu-bot-url>.up.railway.app/webhook/chatwoot")
             print("=" * 60 + "\n")
-            logger.info("Userbot escuchando mensajes activos.")
 
             await client.run_until_disconnected()
 
@@ -245,4 +316,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("\n👋 Userbot detenido.")
+        print("\n👋 Servicio detenido.")
