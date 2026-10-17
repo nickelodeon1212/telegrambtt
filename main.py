@@ -8,7 +8,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import RPCError
 from openai import OpenAI
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 import uvicorn
 
 # Configuración de logs formateados
@@ -31,7 +31,7 @@ CHATWOOT_URL = os.getenv("CHATWOOT_URL")
 CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
 CHATWOOT_INBOX_ID = os.getenv("CHATWOOT_INBOX_ID", "1")
 
-# Puerto para el servidor FastAPI (Railway asigna PORT automáticamente)
+# Puerto para el servidor FastAPI
 PORT = int(os.getenv("PORT", 8080))
 
 if not API_ID_RAW or not API_HASH or not STRING_SESSION or not OPENAI_API_KEY:
@@ -49,26 +49,7 @@ ai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
 # Registro en memoria para pausar la IA cuando un humano interviene desde Chatwoot
-# Diccionario: { sender_id (int): True }
 HUMAN_PAUSED_USERS = {}
-
-SYSTEM_PROMPT = """
-Eres el Asistente Comercial Oficial de Privadazo (privadazo.com), la plataforma líder en Argentina y Brasil para creadoras de contenido.
-
-Tu objetivo principal es responder dudas con un tono cercano, seguro, profesional e invitar a registrarse o unirse a la Waitlist.
-
-REGLAS DE ORO (INVIOLABLES):
-1. RESPONDE ÚNICAMENTE sobre la plataforma Privadazo. Si preguntan sobre otros temas ajenos, responde amablemente: "Lo siento, como asistente de Privadazo solo puedo responder consultas sobre nuestra plataforma y servicios de cobro."
-2. NO DAR CONSEJOS LEGALES O FISCALES. Indicar que Privadazo procesa los cobros de forma discreta y anónima.
-3. CONCISIÓN: Respuestas breves, directas y al grano.
-
-KNOWLEDGE BASE:
-- ¿Qué es Privadazo?: Solución que permite cobrar Shows 1-a-1, Shows Grupales y Canales VIP de Telegram usando Mercado Pago (Argentina) y PIX (Brasil).
-- Anonimato: En el resumen bancario del comprador NO figura contenido adulto ni el nombre real de la creadora.
-- Comisiones: Solo un 11% por transacción cobrada. Sin costos fijos ni mensualidades.
-- Automatización VIP de Telegram: Bot automático que cobra, entrega el link de acceso único y expulsa automáticamente al cliente al vencer el tiempo o suscripción.
-- Registro: Acceso anticipado vía Waitlist en privadazo.com.
-"""
 
 client = TelegramClient(
     StringSession(STRING_SESSION),
@@ -79,9 +60,16 @@ client = TelegramClient(
     retry_delay=5
 )
 
-# ==========================================
-# FUNCIONES DE HELPER PARA CHATWOOT
-# ==========================================
+def cargar_system_prompt() -> str:
+    """Lee el system prompt desde el archivo externo prompt.md."""
+    try:
+        if os.path.exists("prompt.md"):
+            with open("prompt.md", "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception as e:
+        logger.error(f"❌ Error al leer prompt.md: {e}")
+    
+    return "Sos Sam del equipo comercial de Privadazo. Respondé breve y amigable."
 
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
     """Sincroniza mensajes agrupando todo en un único hilo de conversación activa por contacto."""
@@ -157,13 +145,14 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
         logger.error(f"❌ Error al sincronizar con Chatwoot: {e}")
 
 async def consultar_ia(mensaje: str) -> str:
-    """Procesa consultas privadas usando OpenAI."""
+    """Procesa consultas privadas usando OpenAI y el prompt.md dinámico."""
+    system_prompt = cargar_system_prompt()
     try:
         response = await asyncio.to_thread(
             ai_client.chat.completions.create,
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": mensaje}
             ],
             temperature=0.3,
@@ -189,12 +178,10 @@ async def chatwoot_webhook(request: Request):
             message_type = data.get("message_type")
             is_private = data.get("private", False)
 
-            # Nos interesan respuestas humanas salientes que no sean notas privadas
             if message_type == "outgoing" and not is_private:
-                # Verificar si el mensaje fue enviado por un agente (no por la API/bot)
                 sender_type = data.get("sender", {}).get("type")
                 
-                if sender_type == "user":  # 'user' en Chatwoot es el agente humano
+                if sender_type == "user":  # Agente humano
                     content = data.get("content", "")
                     meta = data.get("conversation", {}).get("meta", {})
                     sender_identifier = meta.get("sender", {}).get("identifier")
@@ -202,11 +189,10 @@ async def chatwoot_webhook(request: Request):
                     if sender_identifier and content:
                         telegram_user_id = int(sender_identifier)
                         
-                        # Pausar la IA automáticamente para dar control total al humano
+                        # Pausar la IA automáticamente
                         HUMAN_PAUSED_USERS[telegram_user_id] = True
                         logger.info(f"⏸️ IA pausada para el usuario {telegram_user_id} por intervención humana.")
 
-                        # Enviar el mensaje a Telegram usando Telethon
                         await client.send_message(telegram_user_id, content)
                         logger.info(f"💬 Mensaje manual enviado a Telegram ID {telegram_user_id}: '{content}'")
 
@@ -243,22 +229,26 @@ async def incoming_private_message_handler(event):
     # Sincronizar mensaje entrante en Chatwoot
     asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
-    # Si la IA está pausada para este usuario por intervención humana, no responde OpenAI
     if HUMAN_PAUSED_USERS.get(sender_id, False):
         logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
         return
 
     try:
-        async with client.action(event.chat_id, "typing"):
-            respuesta = await consultar_ia(texto)
-            delay_tipeo = min(len(respuesta) * 0.03, 4.0)
-            await asyncio.sleep(max(1.5, delay_tipeo))
+        respuesta_raw = await consultar_ia(texto)
+        
+        # Dividir la respuesta por el delimitador '||'
+        fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
 
-        await event.reply(respuesta)
-        logger.info(f"📤 Respuesta IA enviada a {sender_name} (ID: {sender_id})")
+        for fragmento in fragmentos:
+            async with client.action(event.chat_id, "typing"):
+                delay_tipeo = min(len(fragmento) * 0.03, 3.0)
+                await asyncio.sleep(max(1.0, delay_tipeo))
 
-        # Sincronizar respuesta saliente en Chatwoot
-        asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, respuesta, "outgoing"))
+            await client.send_message(event.chat_id, fragmento)
+            logger.info(f"📤 Fragmento enviado a {sender_name}: '{fragmento}'")
+
+            # Sincronizar fragmento en Chatwoot
+            asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, fragmento, "outgoing"))
 
     except Exception as e:
         logger.error(f"❌ Error procesando mensaje de {sender_id}: {e}", exc_info=True)
@@ -272,7 +262,6 @@ async def main():
     print("🤖 Iniciando Userbot + Webhook Server de Privadazo...")
     print("=" * 60)
 
-    # Iniciar servidor web FastAPI en segundo plano
     config = uvicorn.Config(app=app, host="0.0.0.0", port=PORT, log_level="warning")
     server = uvicorn.Server(config)
     asyncio.create_task(server.serve())
@@ -294,7 +283,6 @@ async def main():
             print(f"👉 Cuenta: {me.first_name} {getattr(me, 'last_name', '') or ''}".strip())
             print(f"👉 Username: @{me.username or 'sin_username'}")
             print(f"👉 ID: {me.id}")
-            print(f"👉 Webhook URL: https://<tu-bot-url>.up.railway.app/webhook/chatwoot")
             print("=" * 60 + "\n")
 
             await client.run_until_disconnected()
