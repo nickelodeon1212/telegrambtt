@@ -73,7 +73,7 @@ client = TelegramClient(
 )
 
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
-    """Sincroniza los mensajes de Telegram con el Shared Inbox de Chatwoot de forma segura."""
+    """Sincroniza los mensajes de Telegram con el Shared Inbox de Chatwoot de forma completa."""
     if not CHATWOOT_URL or not CHATWOOT_TOKEN:
         return
 
@@ -84,7 +84,7 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
 
     try:
         base_url = CHATWOOT_URL.rstrip('/')
-        async with httpx.AsyncClient(timeout=5.0) as http_client:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
             # 1. Buscar si el contacto ya existe en Chatwoot
             search_url = f"{base_url}/api/v1/accounts/1/contacts/search?q={sender_id}"
             resp = await http_client.get(search_url, headers=headers)
@@ -108,10 +108,42 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
             if not contact_id:
                 return
 
-            logger.info(f"🔄 Sincronizado con Chatwoot - Contacto ID: {contact_id}")
+            # 3. Crear o buscar la conversación activa para este contacto en el Inbox
+            conv_url = f"{base_url}/api/v1/accounts/1/conversations"
+            resp_conv = await http_client.post(conv_url, headers=headers, json={
+                "inbox_id": int(CHATWOOT_INBOX_ID),
+                "contact_id": contact_id,
+                "source_id": str(sender_id)
+            })
+            
+            conversation_id = None
+            if resp_conv.status_code in [200, 201]:
+                conv_data = resp_conv.json()
+                conversation_id = conv_data.get("id")
+
+            # Si la conversación ya existía, la buscamos
+            if not conversation_id:
+                list_conv_url = f"{base_url}/api/v1/accounts/1/contacts/{contact_id}/conversations"
+                resp_list = await http_client.get(list_conv_url, headers=headers)
+                if resp_list.status_code == 200:
+                    convs = resp_list.json().get("payload", [])
+                    if convs:
+                        conversation_id = convs[0]["id"]
+
+            if not conversation_id:
+                return
+
+            # 4. Enviar el mensaje dentro de la conversación
+            msg_url = f"{base_url}/api/v1/accounts/1/conversations/{conversation_id}/messages"
+            await http_client.post(msg_url, headers=headers, json={
+                "content": message_text,
+                "message_type": message_type  # 'incoming' para usuario, 'outgoing' para el bot
+            })
+
+            logger.info(f"✅ Mensaje sincronizado en Chatwoot (Conversación ID: {conversation_id})")
 
     except Exception as e:
-        logger.error(f"❌ Error menor al sincronizar con Chatwoot: {e}")
+        logger.error(f"❌ Error al sincronizar mensaje en Chatwoot: {e}")
 
 async def consultar_ia(mensaje: str) -> str:
     """Procesa consultas privadas usando OpenAI y la Base de Conocimientos de Privadazo."""
