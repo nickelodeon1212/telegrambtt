@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 import asyncio
 import logging
 import httpx
@@ -69,7 +70,7 @@ def cargar_system_prompt() -> str:
     except Exception as e:
         logger.error(f"❌ Error al leer prompt.md: {e}")
     
-    return "Sos Sam del equipo comercial de Privadazo. Respondé breve y amigable."
+    return "Sos parte del equipo comercial de Privadazo. Respondé breve y amigable."
 
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
     """Sincroniza mensajes agrupando todo en un único hilo de conversación activa por contacto."""
@@ -211,7 +212,7 @@ async def health_check():
 
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
 async def incoming_private_message_handler(event):
-    """Maneja mensajes de Telegram, consulta IA si aplica y sincroniza con Chatwoot."""
+    """Maneja mensajes de Telegram simulando tiempo de lectura y tipeo humano."""
     sender = await event.get_sender()
 
     if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
@@ -234,15 +235,24 @@ async def incoming_private_message_handler(event):
         return
 
     try:
+        # 1. Pausa de lectura inicial (Simula ver y leer el mensaje entrante: entre 3.0 y 5.5 seg)
+        await asyncio.sleep(random.uniform(3.0, 5.5))
+
         respuesta_raw = await consultar_ia(texto)
         
         # Dividir la respuesta por el delimitador '||'
         fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
 
-        for fragmento in fragmentos:
+        for index, fragmento in enumerate(fragmentos):
+            # Pausa de pensamiento entre fragmentos si hay más de uno
+            if index > 0:
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+
+            # 2. Simular tipeo proporcional a la longitud (mínimo 3.5 seg, máximo 9.0 seg)
+            tiempo_tipeo = max(3.5, min(len(fragmento) * 0.09, 9.0))
+
             async with client.action(event.chat_id, "typing"):
-                delay_tipeo = min(len(fragmento) * 0.03, 3.0)
-                await asyncio.sleep(max(1.0, delay_tipeo))
+                await asyncio.sleep(tiempo_tipeo)
 
             await client.send_message(event.chat_id, fragmento)
             logger.info(f"📤 Fragmento enviado a {sender_name}: '{fragmento}'")
