@@ -50,10 +50,11 @@ except ValueError:
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Privadazo Multi-Userbot Engine")
 
-# Estructuras globales para Multi-Userbots y Pausas Humanas
+# Estructuras globales para Multi-Userbots, Pausas Humanas y Filtro Anti-Loop
 ACTIVE_CLIENTS = []       # Lista de dicts: {"client": TelegramClient, "me": User, "name": str}
 BOT_POOL = None            # Generador rotativo
 HUMAN_PAUSED_USERS = {}   # Registro de usuarios pausados por agente humano
+MY_BOT_IDS = set()        # 🛡️ Set dinámico para almacenar los IDs de Telegram de nuestras cuentas
 
 class OutboundPayload(BaseModel):
     telegram_handle: str
@@ -244,11 +245,17 @@ def registrar_event_handler(client, bot_name):
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def handler(event):
         sender = await event.get_sender()
+        sender_id = event.sender_id
+
+        # 🛑 FILTRO ANTI-LOOP: Ignorar mensajes provenientes de nuestras propias cuentas
+        if sender_id in MY_BOT_IDS:
+            logger.info(f"🚫 [Anti-Loop] Mensaje ignorado: proviene de una de nuestras cuentas (ID: {sender_id}).")
+            return
+
         if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
             return
 
         sender_name = getattr(sender, "first_name", "Usuario")
-        sender_id = event.sender_id
         texto = event.raw_text
         if not texto:
             return
@@ -262,15 +269,22 @@ def registrar_event_handler(client, bot_name):
             return
 
         try:
-            await asyncio.sleep(random.uniform(3.0, 5.5))
+            # ⏱️ DELAY HUMANO REALISTA: Espera aleatoria entre 1 y 5 minutos (60 a 300 segundos)
+            delay_lectura = random.uniform(60.0, 300.0)
+            logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
+            await asyncio.sleep(delay_lectura)
+
             respuesta_raw = await consultar_ia(texto)
             fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
 
             for index, fragmento in enumerate(fragmentos):
                 if index > 0:
-                    await asyncio.sleep(random.uniform(2.0, 4.0))
+                    # Pausa de reflexión entre fragmentos
+                    await asyncio.sleep(random.uniform(4.0, 10.0))
 
-                tiempo_tipeo = max(3.5, min(len(fragmento) * 0.09, 9.0))
+                # ⌨️ SIMULACIÓN DE TIPEO: Se muestra "escribiendo..." durante 5 a 14 segundos
+                tiempo_tipeo = max(5.0, min(len(fragmento) * 0.12 + random.uniform(1.0, 3.0), 14.0))
+                
                 async with client.action(event.chat_id, "typing"):
                     await asyncio.sleep(tiempo_tipeo)
 
@@ -320,10 +334,14 @@ async def main():
                 
                 if await cli.is_user_authorized():
                     me = await cli.get_me()
+                    
+                    # 🛡️ Registrar el ID en la lista anti-loop
+                    MY_BOT_IDS.add(me.id)
+                    
                     bot_name = f"{me.first_name} (@{me.username or 'sin_username'})"
                     ACTIVE_CLIENTS.append({"client": cli, "me": me, "name": bot_name})
                     registrar_event_handler(cli, bot_name)
-                    logger.info(f"✅ Userbot conectado: {bot_name} [{key}]")
+                    logger.info(f"✅ Userbot conectado: {bot_name} [{key}] (ID: {me.id})")
                 else:
                     logger.error(f"❌ Sesión inválida en {key}")
             except Exception as e:
@@ -336,6 +354,7 @@ async def main():
     BOT_POOL = itertools.cycle(ACTIVE_CLIENTS)
     print("\n" + "=" * 60)
     print(f"🚀 ¡Motor activo con {len(ACTIVE_CLIENTS)} Userbots rotando exitosamente!")
+    print(f"🛡️ IDs protegidos por filtro anti-loop: {MY_BOT_IDS}")
     print("=" * 60 + "\n")
 
     # Mantener todas las conexiones activas
