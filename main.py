@@ -53,7 +53,7 @@ app = FastAPI(title="Privadazo Multi-Userbot Engine")
 # Estructuras globales para Multi-Userbots, Pausas Humanas y Filtro Anti-Loop
 ACTIVE_CLIENTS = []       # Lista de dicts: {"client": TelegramClient, "me": User, "name": str}
 BOT_POOL = None            # Generador rotativo
-HUMAN_PAUSED_USERS = {}   # Registro de usuarios pausados por agente humano
+HUMAN_PAUSED_USERS = {}    # Registro de usuarios pausados por agente humano
 MY_BOT_IDS = set()        # 🛡️ Set dinámico para almacenar los IDs de Telegram de nuestras cuentas
 
 class OutboundPayload(BaseModel):
@@ -247,7 +247,7 @@ def registrar_event_handler(client, bot_name):
         sender = await event.get_sender()
         sender_id = event.sender_id
 
-        # 🛑 FILTRO ANTI-LOOP: Ignorar mensajes provenientes de nuestras propias cuentas
+        # 🛡️ FILTRO ANTI-LOOP: Ignorar mensajes provenientes de nuestras propias cuentas
         if sender_id in MY_BOT_IDS:
             logger.info(f"🚫 [Anti-Loop] Mensaje ignorado: proviene de una de nuestras cuentas (ID: {sender_id}).")
             return
@@ -264,9 +264,11 @@ def registrar_event_handler(client, bot_name):
 
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
-        if HUMAN_PAUSED_USERS.get(sender_id, False):
-            logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
-            return
+        # 🧪 [MODO TEST INTENSIVO] Pausa humana comentada para pruebas libres:
+        # if HUMAN_PAUSED_USERS.get(sender_id, False):
+        #     logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
+        #     return
+        logger.info(f"🧪 [MODO TEST] Forzando respuesta de IA para {sender_id} sin importar pausas.")
 
         try:
             # ⏱️ DELAY HUMANO REALISTA: Espera aleatoria entre 1 y 5 minutos (60 a 300 segundos)
