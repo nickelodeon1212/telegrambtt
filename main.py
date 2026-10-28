@@ -9,7 +9,6 @@ import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import RPCError
 from openai import OpenAI
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
@@ -53,7 +52,7 @@ except ValueError:
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Privadazo Multi-Userbot Engine")
 
-# Cliente de Redis para la memoria de contexto cercano
+# Cliente de Redis
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 ACTIVE_CLIENTS = []       
@@ -192,7 +191,6 @@ async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
         )
         respuesta_ia = response.choices[0].message.content.strip()
 
-        # Guardar la idea limpia en Redis
         respuesta_limpia_para_redis = respuesta_ia.replace("||", " ")
         await guardar_en_redis(sender_id, "user", mensaje)
         await guardar_en_redis(sender_id, "assistant", respuesta_limpia_para_redis)
@@ -203,12 +201,11 @@ async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
         return "¡Hola! Estoy experimentando una breve interrupción. Por favor escríbeme de nuevo en un instante."
 
 # ==========================================
-# ENDPOINTS FASTAPI (WEBHOOKS & OUTBOUND)
+# ENDPOINTS FASTAPI
 # ==========================================
 
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request):
-    """Escucha eventos de Chatwoot. Evita bucles filtrando mensajes automáticos de la IA."""
     try:
         data = await request.json()
         event_type = data.get("event")
@@ -219,30 +216,20 @@ async def chatwoot_webhook(request: Request):
 
             if message_type == "outgoing" and not is_private:
                 sender_type = data.get("sender", {}).get("type")
-                
-                # Solo pausar si el mensaje proviene de un agente humano real en Chatwoot (type == "user" y no es un bot integrado)
                 if sender_type == "user":  
                     content = data.get("content", "")
                     meta = data.get("conversation", {}).get("meta", {})
                     sender_identifier = meta.get("sender", {}).get("identifier")
 
-                    # Validar adicionalmente que el agente no sea un sistema automático
-                    agent_name = data.get("sender", {}).get("name", "")
-                    if "Bot" in agent_name or "AI" in agent_name:
-                        return {"status": "ignored_bot_outgoing"}
-
                     if sender_identifier and content:
                         telegram_user_id = int(sender_identifier)
                         HUMAN_PAUSED_USERS[telegram_user_id] = True
-                        logger.info(f"⏸️ IA pausada para el usuario {telegram_user_id} por intervención humana en Chatwoot.")
-
                         if ACTIVE_CLIENTS:
                             client = ACTIVE_CLIENTS[0]["client"]
                             await client.send_message(telegram_user_id, content)
 
         return {"status": "ok"}
     except Exception as e:
-        logger.error(f"❌ Error en webhook de Chatwoot: {e}")
         return {"status": "error", "detail": str(e)}
 
 @app.post("/api/outbound")
@@ -275,18 +262,28 @@ def registrar_event_handler(client, bot_name):
     async def handler(event):
         sender = await event.get_sender()
         sender_id = event.sender_id
+        message_id = event.id
 
+        # 1. Ignorar si el mensaje viene de nuestras propias cuentas
         if sender_id in MY_BOT_IDS:
             return
 
         if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
             return
 
-        sender_name = getattr(sender, "first_name", "Usuario")
         texto = event.raw_text
         if not texto:
             return
 
+        # 2. 🛡️ BLOQUEO ATÓMICO EN REDIS (Evita duplicados exactos en un margen de 10 segundos)
+        if redis_client:
+            dedup_key = f"dedup:msg:{sender_id}:{message_id}"
+            is_new = await redis_client.set(dedup_key, "processed", nx=True, ex=10)
+            if not is_new:
+                logger.info(f"🚫 [{bot_name}] Mensaje duplicado descartado (ID: {message_id} de usuario {sender_id})")
+                return
+
+        sender_name = getattr(sender, "first_name", "Usuario")
         logger.info(f"📩 [{bot_name}] Mensaje de {sender_name} (ID: {sender_id}): '{texto}'")
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
@@ -295,22 +292,20 @@ def registrar_event_handler(client, bot_name):
             return
 
         try:
-            # ⏱️ Delay de lectura de 10 a 20 segundos
-            delay_lectura = random.uniform(10.0, 20.0)
+            # Delay corto para testeo ágil
+            delay_lectura = random.uniform(5.0, 10.0)
             logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
 
             respuesta_raw = await consultar_ia_con_memoria(sender_id, texto)
             
-            # Separar fragmentos por '||'
             fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
 
             for index, fragmento in enumerate(fragmentos):
                 if index > 0:
-                    # Pausa natural de 3 a 6 segundos entre globo y globo
-                    await asyncio.sleep(random.uniform(3.0, 6.0))
+                    await asyncio.sleep(random.uniform(2.0, 4.0))
 
-                tiempo_tipeo = max(2.5, min(len(fragmento) * 0.08 + random.uniform(1.0, 2.0), 7.0))
+                tiempo_tipeo = max(2.0, min(len(fragmento) * 0.08 + random.uniform(0.5, 1.5), 5.0))
                 
                 async with client.action(event.chat_id, "typing"):
                     await asyncio.sleep(tiempo_tipeo)
@@ -354,10 +349,22 @@ async def main():
                     bot_name = f"{me.first_name} (@{me.username or 'sin_username'})"
                     ACTIVE_CLIENTS.append({"client": cli, "me": me, "name": bot_name})
                     registrar_event_handler(cli, bot_name)
+                    logger.info(f"✅ Userbot conectado: {bot_name} [{key}] (ID: {me.id})")
+                else:
+                    logger.error(f"❌ Sesión inválida en {key}")
             except Exception as e:
                 logger.error(f"❌ Error conectando {key}: {e}")
 
+    if not ACTIVE_CLIENTS:
+        logger.error("❌ Ninguna cuenta de Telegram pudo conectarse.")
+        sys.exit(1)
+
     BOT_POOL = itertools.cycle(ACTIVE_CLIENTS)
+    print("\n" + "=" * 60)
+    print(f"🚀 ¡Motor activo con {len(ACTIVE_CLIENTS)} Userbots rotando exitosamente!")
+    print(f"🛡️ IDs protegidos por filtro anti-loop: {MY_BOT_IDS}")
+    print("=" * 60 + "\n")
+
     await asyncio.gather(*(c["client"].run_until_disconnected() for c in ACTIVE_CLIENTS))
 
 if __name__ == "__main__":
