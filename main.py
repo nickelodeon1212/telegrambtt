@@ -4,6 +4,7 @@ import random
 import asyncio
 import logging
 import itertools
+import json
 import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -13,6 +14,7 @@ from openai import OpenAI
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uvicorn
+import redis.asyncio as redis
 
 # Configuración de logs formateados
 logging.basicConfig(
@@ -27,6 +29,7 @@ load_dotenv()
 API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
 
 # Credenciales de Chatwoot
 CHATWOOT_URL = os.getenv("CHATWOOT_URL")
@@ -46,9 +49,12 @@ except ValueError:
     logger.error("❌ API_ID debe ser un valor numérico entero.")
     sys.exit(1)
 
-# Inicializar cliente OpenAI y FastAPI
+# Inicializar clientes
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="Privadazo Multi-Userbot Engine")
+
+# Cliente de Redis para la memoria de contexto cercano
+redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 # Estructuras globales para Multi-Userbots, Pausas Humanas y Filtro Anti-Loop
 ACTIVE_CLIENTS = []       # Lista de dicts: {"client": TelegramClient, "me": User, "name": str}
@@ -70,6 +76,36 @@ def cargar_system_prompt() -> str:
     except Exception as e:
         logger.error(f"❌ Error al leer prompt.md: {e}")
     return "Sos parte del equipo comercial de Privadazo. Respondé breve y amigable."
+
+async def obtener_historial_redis(sender_id: int) -> list:
+    """Recupera los últimos mensajes de Redis para dar contexto a la IA."""
+    if not redis_client:
+        return []
+    try:
+        key = f"chat:history:{sender_id}"
+        mensajes_raw = await redis_client.lrange(key, 0, -1)
+        historial = []
+        for m in mensajes_raw:
+            historial.append(json.loads(m))
+        return historial
+    except Exception as e:
+        logger.error(f"❌ Error leyendo historial de Redis: {e}")
+        return []
+
+async def guardar_en_redis(sender_id: int, rol: str, contenido: str):
+    """Guarda un mensaje en el historial de Redis (ventana deslizante de 10 mensajes) y renueva TTL de 2 horas."""
+    if not redis_client:
+        return
+    try:
+        key = f"chat:history:{sender_id}"
+        item = json.dumps({"role": rol, "content": contenido})
+        await redis_client.rpush(key, item)
+        # Mantener solo los últimos 10 mensajes (5 pares usuario/asistente)
+        await redis_client.ltrim(key, -10, -1)
+        # Expirar el historial si pasan 2 horas sin actividad
+        await redis_client.expire(key, 7200)
+    except Exception as e:
+        logger.error(f"❌ Error guardando en Redis: {e}")
 
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
     """Sincroniza mensajes agrupando todo en un único hilo de conversación activa por contacto."""
@@ -144,23 +180,39 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
     except Exception as e:
         logger.error(f"❌ Error al sincronizar con Chatwoot: {e}")
 
-async def consultar_ia(mensaje: str) -> str:
-    """Procesa consultas privadas usando OpenAI y el prompt.md dinámico."""
+async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
+    """Procesa consultas con OpenAI inyectando el historial reciente de Redis."""
     system_prompt = cargar_system_prompt()
+    
+    # 1. Obtener historial previo desde Redis
+    historial = await obtener_historial_redis(sender_id)
+
+    # 2. Armar el array de mensajes para OpenAI (System + Historial + Mensaje nuevo)
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in historial:
+        messages.append(h)
+    
+    messages.append({"role": "user", "content": mensaje})
+
     try:
         response = await asyncio.to_thread(
             ai_client.chat.completions.create,
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": mensaje}
-            ],
+            messages=messages,
             temperature=0.3,
             max_tokens=300
         )
-        return response.choices[0].message.content.strip()
+        respuesta_ia = response.choices[0].message.content.strip()
+
+        # 3. Guardar la nueva interacción en Redis de forma asíncrona
+        await asyncio.gather(
+            guardar_en_redis(sender_id, "user", mensaje),
+            guardar_en_redis(sender_id, "assistant", respuesta_ia)
+        )
+
+        return respuesta_ia
     except Exception as e:
-        logger.error(f"❌ Error consultando la IA: {e}")
+        logger.error(f"❌ Error consultando la IA con memoria: {e}")
         return "¡Hola! Estoy experimentando una breve interrupción. Por favor escríbeme de nuevo en un instante."
 
 # ==========================================
@@ -264,11 +316,10 @@ def registrar_event_handler(client, bot_name):
 
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
-        # 🧪 [MODO TEST INTENSIVO] Pausa humana comentada para pruebas libres:
-        # if HUMAN_PAUSED_USERS.get(sender_id, False):
-        #     logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
-        #     return
-        logger.info(f"🧪 [MODO TEST] Forzando respuesta de IA para {sender_id} sin importar pausas.")
+        # 🛡️ PAUSA HUMANA ACTIVADA PARA PRODUCCIÓN:
+        if HUMAN_PAUSED_USERS.get(sender_id, False):
+            logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
+            return
 
         try:
             # ⏱️ DELAY HUMANO REALISTA: Espera aleatoria entre 1 y 5 minutos (60 a 300 segundos)
@@ -276,7 +327,8 @@ def registrar_event_handler(client, bot_name):
             logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
 
-            respuesta_raw = await consultar_ia(texto)
+            # Consulta a OpenAI integrando la memoria de contexto cercano de Redis
+            respuesta_raw = await consultar_ia_con_memoria(sender_id, texto)
             fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
 
             for index, fragmento in enumerate(fragmentos):
