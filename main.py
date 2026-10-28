@@ -192,7 +192,7 @@ async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
         )
         respuesta_ia = response.choices[0].message.content.strip()
 
-        # Guardar la idea limpia en Redis (removiendo el marcador || para que el historial sea claro)
+        # Guardar la idea limpia en Redis
         respuesta_limpia_para_redis = respuesta_ia.replace("||", " ")
         await guardar_en_redis(sender_id, "user", mensaje)
         await guardar_en_redis(sender_id, "assistant", respuesta_limpia_para_redis)
@@ -208,6 +208,7 @@ async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
 
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request):
+    """Escucha eventos de Chatwoot. Evita bucles filtrando mensajes automáticos de la IA."""
     try:
         data = await request.json()
         event_type = data.get("event")
@@ -218,20 +219,30 @@ async def chatwoot_webhook(request: Request):
 
             if message_type == "outgoing" and not is_private:
                 sender_type = data.get("sender", {}).get("type")
+                
+                # Solo pausar si el mensaje proviene de un agente humano real en Chatwoot (type == "user" y no es un bot integrado)
                 if sender_type == "user":  
                     content = data.get("content", "")
                     meta = data.get("conversation", {}).get("meta", {})
                     sender_identifier = meta.get("sender", {}).get("identifier")
 
+                    # Validar adicionalmente que el agente no sea un sistema automático
+                    agent_name = data.get("sender", {}).get("name", "")
+                    if "Bot" in agent_name or "AI" in agent_name:
+                        return {"status": "ignored_bot_outgoing"}
+
                     if sender_identifier and content:
                         telegram_user_id = int(sender_identifier)
                         HUMAN_PAUSED_USERS[telegram_user_id] = True
+                        logger.info(f"⏸️ IA pausada para el usuario {telegram_user_id} por intervención humana en Chatwoot.")
+
                         if ACTIVE_CLIENTS:
                             client = ACTIVE_CLIENTS[0]["client"]
                             await client.send_message(telegram_user_id, content)
 
         return {"status": "ok"}
     except Exception as e:
+        logger.error(f"❌ Error en webhook de Chatwoot: {e}")
         return {"status": "error", "detail": str(e)}
 
 @app.post("/api/outbound")
@@ -280,10 +291,11 @@ def registrar_event_handler(client, bot_name):
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
         if HUMAN_PAUSED_USERS.get(sender_id, False):
+            logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
             return
 
         try:
-            # ⏱️ Delay de lectura de 10 a 20 segundos para pruebas ágiles
+            # ⏱️ Delay de lectura de 10 a 20 segundos
             delay_lectura = random.uniform(10.0, 20.0)
             logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
@@ -298,7 +310,6 @@ def registrar_event_handler(client, bot_name):
                     # Pausa natural de 3 a 6 segundos entre globo y globo
                     await asyncio.sleep(random.uniform(3.0, 6.0))
 
-                # Simulación de tipeo rápida por fragmento
                 tiempo_tipeo = max(2.5, min(len(fragmento) * 0.08 + random.uniform(1.0, 2.0), 7.0))
                 
                 async with client.action(event.chat_id, "typing"):
