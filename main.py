@@ -91,7 +91,7 @@ async def obtener_historial_redis(sender_id: int) -> list:
         return []
 
 async def guardar_en_redis(sender_id: int, rol: str, contenido: str):
-    """Guarda un mensaje en el historial de Redis (ventana deslizante de 10 mensajes) con TTL de 2 horas."""
+    """Guarda un mensaje en el historial de Redis con TTL de 2 horas."""
     if not redis_client:
         return
     try:
@@ -257,30 +257,39 @@ async def health_check():
 # LOGICA DE MENSAJES ENTRANTES (INBOUND)
 # ==========================================
 
-def registrar_event_handler(client, bot_name):
+def registrar_event_handler(client, bot_name, bot_id):
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def handler(event):
         sender = await event.get_sender()
         sender_id = event.sender_id
         message_id = event.id
 
-        # 1. Ignorar si el mensaje viene de nuestras propias cuentas
+        # 1. Ignorar mensajes propios
         if sender_id in MY_BOT_IDS:
             return
 
         if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
             return
 
+        # 🛡️ 2. FILTRO ESTRICTO DE AISLAMIENTO: Asegurar que este evento pertenece específicamente a ESTE cliente
+        # (Evita que las 9 sesiones procesen el mismo mensaje entrante de forma cruzada)
+        try:
+            me_client = await client.get_me()
+            if me_client.id != bot_id:
+                return
+        except Exception:
+            pass
+
         texto = event.raw_text
         if not texto:
             return
 
-        # 2. 🛡️ BLOQUEO ATÓMICO EN REDIS (Evita duplicados exactos en un margen de 10 segundos)
+        # 3. 🛡️ BLOQUEO ATÓMICO EN REDIS (Anti-duplicados por ID de mensaje)
         if redis_client:
-            dedup_key = f"dedup:msg:{sender_id}:{message_id}"
-            is_new = await redis_client.set(dedup_key, "processed", nx=True, ex=10)
+            dedup_key = f"dedup:msg:{bot_id}:{sender_id}:{message_id}"
+            is_new = await redis_client.set(dedup_key, "processed", nx=True, ex=15)
             if not is_new:
-                logger.info(f"🚫 [{bot_name}] Mensaje duplicado descartado (ID: {message_id} de usuario {sender_id})")
+                logger.info(f"🚫 [{bot_name}] Mensaje duplicado descartado (ID: {message_id})")
                 return
 
         sender_name = getattr(sender, "first_name", "Usuario")
@@ -292,7 +301,7 @@ def registrar_event_handler(client, bot_name):
             return
 
         try:
-            # Delay corto para testeo ágil
+            # Delay para testeo ágil
             delay_lectura = random.uniform(5.0, 10.0)
             logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
@@ -315,7 +324,7 @@ def registrar_event_handler(client, bot_name):
                 asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, fragmento, "outgoing"))
 
         except Exception as e:
-            logger.error(f"❌ Error procesando mensaje: {e}", exc_info=True)
+            logger.error(f"❌ Error procesando mensaje en {bot_name}: {e}", exc_info=True)
 
 # ==========================================
 # MAIN
@@ -348,7 +357,7 @@ async def main():
                     MY_BOT_IDS.add(me.id)
                     bot_name = f"{me.first_name} (@{me.username or 'sin_username'})"
                     ACTIVE_CLIENTS.append({"client": cli, "me": me, "name": bot_name})
-                    registrar_event_handler(cli, bot_name)
+                    registrar_event_handler(cli, bot_name, me.id)
                     logger.info(f"✅ Userbot conectado: {bot_name} [{key}] (ID: {me.id})")
                 else:
                     logger.error(f"❌ Sesión inválida en {key}")
