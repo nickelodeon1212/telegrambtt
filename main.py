@@ -260,7 +260,6 @@ async def health_check():
 def registrar_event_handler(client, bot_name, bot_id):
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def handler(event, current_cli=client):
-        # 1. AISLAMIENTO ESTRICTO: Si el evento no proviene del cliente dueño de esta función, descartar inmediatamente
         if event.client != current_cli:
             return
 
@@ -268,7 +267,6 @@ def registrar_event_handler(client, bot_name, bot_id):
         sender_id = event.sender_id
         message_id = event.id
 
-        # 2. Ignorar si el remitente es uno de nuestros bots
         if sender_id in MY_BOT_IDS:
             return
 
@@ -279,21 +277,21 @@ def registrar_event_handler(client, bot_name, bot_id):
         if not texto:
             return
 
-        # 3. 🛡️ BLOQUEO EN REDIS ANTI-DUPLICADOS (Por usuario y por mensaje)
-        user_lock_key = f"user:processing:{sender_id}"
-        msg_dedup_key = f"dedup:msg:{bot_id}:{sender_id}:{message_id}"
+        # 🛡️ BLOQUEO GLOBAL ÚNICO EN REDIS (Independiente del bot que reciba el mensaje)
+        global_user_lock = f"lock:global:user:{sender_id}"
+        global_msg_dedup = f"dedup:global:msg:{sender_id}:{message_id}"
 
         if redis_client:
-            # Descartar mensaje duplicado idéntico
-            is_new_msg = await redis_client.set(msg_dedup_key, "1", nx=True, ex=20)
+            # 1. Evitar procesamiento duplicado exacto del mismo mensaje
+            is_new_msg = await redis_client.set(global_msg_dedup, "1", nx=True, ex=30)
             if not is_new_msg:
-                logger.info(f"🚫 [{bot_name}] Mensaje duplicado ya registrado (ID: {message_id}). Omitiendo.")
+                logger.info(f"🚫 [{bot_name}] Mensaje ID {message_id} ya procesado globalmente. Descartando.")
                 return
 
-            # Lock global por usuario: Evita que dos bots o hilos le respondan al mismo usuario en simultáneo
-            acquired_user_lock = await redis_client.set(user_lock_key, str(bot_id), nx=True, ex=30)
-            if not acquired_user_lock:
-                logger.info(f"🔒 [{bot_name}] El usuario {sender_id} ya tiene una respuesta en proceso por otro bot. Omitiendo.")
+            # 2. Lock global por usuario: Ningún otro bot puede responderle mientras este esté respondiendo
+            acquired_lock = await redis_client.set(global_user_lock, str(bot_id), nx=True, ex=45)
+            if not acquired_lock:
+                logger.info(f"🔒 [{bot_name}] El usuario {sender_id} ya está siendo atendido por otro userbot. Descartando.")
                 return
 
         sender_name = getattr(sender, "first_name", "Usuario")
@@ -303,11 +301,10 @@ def registrar_event_handler(client, bot_name, bot_id):
         if HUMAN_PAUSED_USERS.get(sender_id, False):
             logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
             if redis_client:
-                await redis_client.delete(user_lock_key)
+                await redis_client.delete(global_user_lock)
             return
 
         try:
-            # Delay corto y natural
             delay_lectura = random.uniform(4.0, 8.0)
             logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
@@ -332,9 +329,9 @@ def registrar_event_handler(client, bot_name, bot_id):
         except Exception as e:
             logger.error(f"❌ Error procesando mensaje en {bot_name}: {e}", exc_info=True)
         finally:
-            # Liberar lock del usuario al terminar de enviar
+            # Liberar el lock global para que pueda volver a recibir mensajes después
             if redis_client:
-                await redis_client.delete(user_lock_key)
+                await redis_client.delete(global_user_lock)
 
 # ==========================================
 # MAIN
