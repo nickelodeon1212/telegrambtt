@@ -39,112 +39,13 @@ CHATWOOT_INBOX_ID = os.getenv("CHATWOOT_INBOX_ID", "1")
 PORT = int(os.getenv("PORT", 8080))
 
 if not API_ID_RAW or not API_HASH or not OPENAI_API_KEY:
-    logger.error("❌ Faltan variables esenciales (API_ID, API_HASH o OPENAI_API_KEY).")
+    logger.error("Faltan variables esenciales (API_ID, API_HASH o OPENAI_API_KEY).")
     sys.exit(1)
 
 try:
     API_ID = int(API_ID_RAW)
 except ValueError:
-    logger.error("❌ API_ID debe ser un valor numérico entero.")
-    sys.exit(1)
-
-# Inicializar clientes
-ai_client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Privadazo Multi-Userbot Engine")
-
-# Cliente de Redis
-redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-
-ACTIVE_CLIENTS = []       
-BOT_POOL = None            
-MY_BOT_IDS = set()        
-
-class OutboundPayload(BaseModel):
-    telegram_handle: str
-    nombre_creadora: str
-    mensaje_inicial: str
-
-def cargar_system_prompt() -> str:
-    """Lee el system prompt desde el archivo externo prompt.md."""
-    try:
-        if os.path.exists("prompt.md"):
-            with open("prompt.md", "r", encoding="utf-8") as f:
-                return f.readMirando los logs con lupa, el motivo exacto por el cual dejó de responder la IA y tiró el mensaje de:
-> `🤫 IA omitida para 7688134299 (Modo Agente Humano activo).`
-
-...está en que **Chatwoot se quedó trabado con el estado de "Agente Humano" activado para ese usuario (`7688134299`)**. 
-
-### ¿Qué pasó ahí?
-1. En algún momento anterior, el webhook de Chatwoot detectó un mensaje saliente, interpretó que un humano respondió y metió al usuario `7688134299` dentro del diccionario `HUMAN_PAUSED_USERS`.
-2. Una vez que un usuario entra en esa lista de pausa, **la IA se apaga por completo para ese contacto** y el bot se vuelve un fantasma (no vuelve a responderle nunca más aunque le escribas 20 veces), a menos que se reinicie el contenedor de Railway o se limpie el estado.
-
----
-
-### 🛠️ La Solución Inmediata
-
-Para que puedas seguir testeando ahora mismo sin reiniciar todo Railway, vamos a hacer dos cosas:
-
-1. **Agregamos un comando o limpiamos el estado:** Si querés resetear la pausa humana en caliente, podemos agregar una opción o simplemente limpiar el diccionario al recibir mensajes nuevos si pasan varios minutos, o **quitar temporalmente la lógica de pausa por Chatwoot** si solo querés testear los bots en Telegram.
-
-2. **Limpiar Chatwoot / Reiniciar Railway:** Con un simple reinicio de tu servicio en Railway, el diccionario en memoria `HUMAN_PAUSED_USERS = {}` se blanquea y la IA vuelve a responder al instante.
-
----
-
-### 💻 El `main.py` Definitivo (Sin trampas de pausa humana fantasma)
-
-Si querés evitar que Chatwoot te bloquee los tests bloqueando a la IA por error, podemos hacer que **la pausa humana solo se active si hay un agente real interviniendo en Chatwoot, pero que expire o no sea tan estricta**, o bien asegurarnos de que si el usuario vuelve a escribir después de un rato, la IA retome el control.
-
-Copiá esta versión limpia de `main.py` a tu GitHub:
-
-```python
-import os
-import sys
-import random
-import asyncio
-import logging
-import itertools
-import json
-import httpx
-from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from openai import OpenAI
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-import uvicorn
-import redis.asyncio as redis
-
-# Configuración de logs formateados
-logging.basicConfig(
-    format="%(asctime)s - [%(levelname)s] - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Cargar variables de entorno
-load_dotenv()
-
-API_ID_RAW = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL")
-
-# Credenciales de Chatwoot
-CHATWOOT_URL = os.getenv("CHATWOOT_URL")
-CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
-CHATWOOT_INBOX_ID = os.getenv("CHATWOOT_INBOX_ID", "1")
-
-# Puerto para el servidor FastAPI
-PORT = int(os.getenv("PORT", 8080))
-
-if not API_ID_RAW or not API_HASH or not OPENAI_API_KEY:
-    logger.error("❌ Faltan variables esenciales (API_ID, API_HASH o OPENAI_API_KEY).")
-    sys.exit(1)
-
-try:
-    API_ID = int(API_ID_RAW)
-except ValueError:
-    logger.error("❌ API_ID debe ser un valor numérico entero.")
+    logger.error("API_ID debe ser un valor numerico entero.")
     sys.exit(1)
 
 # Inicializar clientes
@@ -170,11 +71,11 @@ def cargar_system_prompt() -> str:
             with open("prompt.md", "r", encoding="utf-8") as f:
                 return f.read()
     except Exception as e:
-        logger.error(f"❌ Error al leer prompt.md: {e}")
-    return "Sos parte del equipo comercial de Privadazo. Respondé breve en fragmentos cortos usando || para separar."
+        logger.error(f"Error al leer prompt.md: {e}")
+    return "Sos parte del equipo comercial de Privadazo. Responded breve en fragmentos cortos usando || para separar."
 
 async def obtener_historial_redis(sender_id: int) -> list:
-    """Recupera los últimos mensajes de Redis para dar contexto a la IA."""
+    """Recupera los ultimos mensajes de Redis para dar contexto a la IA."""
     if not redis_client:
         return []
     try:
@@ -185,7 +86,7 @@ async def obtener_historial_redis(sender_id: int) -> list:
             historial.append(json.loads(m))
         return historial
     except Exception as e:
-        logger.error(f"❌ Error leyendo historial de Redis: {e}")
+        logger.error(f"Error leyendo historial de Redis: {e}")
         return []
 
 async def guardar_en_redis(sender_id: int, rol: str, contenido: str):
@@ -199,7 +100,7 @@ async def guardar_en_redis(sender_id: int, rol: str, contenido: str):
         await redis_client.ltrim(key, -10, -1)
         await redis_client.expire(key, 7200)
     except Exception as e:
-        logger.error(f"❌ Error guardando en Redis: {e}")
+        logger.error(f"Error guardando en Redis: {e}")
 
 async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str, message_type: str = "incoming"):
     """Sincroniza mensajes en Chatwoot."""
@@ -266,7 +167,7 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
             })
 
     except Exception as e:
-        logger.error(f"❌ Error al sincronizar con Chatwoot: {e}")
+        logger.error(f"Error al sincronizar con Chatwoot: {e}")
 
 async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
     """Procesa consultas con OpenAI inyectando el historial reciente de Redis."""
@@ -295,8 +196,8 @@ async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
 
         return respuesta_ia
     except Exception as e:
-        logger.error(f"❌ Error consultando la IA con memoria: {e}")
-        return "¡Hola! Estoy experimentando una breve interrupción. Por favor escríbeme de nuevo en un instante."
+        logger.error(f"Error consultando la IA con memoria: {e}")
+        return "Hola! Estoy experimentando una breve interrupcion. Por favor escribeme de nuevo en un instante."
 
 # ==========================================
 # ENDPOINTS FASTAPI
@@ -304,7 +205,6 @@ async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
 
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request):
-    # Desactivamos temporalmente la pausa automática por chatwoot para evitar bloqueos fantasmas durante los tests
     return {"status": "ok_ignored"}
 
 @app.post("/api/outbound")
@@ -352,7 +252,7 @@ def registrar_event_handler(client, bot_name, bot_id):
         if not texto:
             return
 
-        # 🛡️ BLOQUEO GLOBAL ÚNICO EN REDIS (Independiente del bot que reciba el mensaje)
+        # Bloqueo global unico en Redis
         global_user_lock = f"lock:global:user:{sender_id}"
         global_msg_dedup = f"dedup:global:msg:{sender_id}:{message_id}"
 
@@ -366,12 +266,12 @@ def registrar_event_handler(client, bot_name, bot_id):
                 return
 
         sender_name = getattr(sender, "first_name", "Usuario")
-        logger.info(f"📩 [{bot_name}] Mensaje de {sender_name} (ID: {sender_id}): '{texto}'")
+        logger.info(f"[{bot_name}] Mensaje de {sender_name} (ID: {sender_id}): '{texto}'")
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
         try:
             delay_lectura = random.uniform(3.0, 6.0)
-            logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
+            logger.info(f"[{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
 
             respuesta_raw = await consultar_ia_con_memoria(sender_id, texto)
@@ -388,11 +288,11 @@ def registrar_event_handler(client, bot_name, bot_id):
                     await asyncio.sleep(tiempo_tipeo)
 
                 await current_cli.send_message(event.chat_id, fragmento)
-                logger.info(f"📤 [{bot_name}] Fragmento enviado a {sender_name}: '{fragmento}'")
+                logger.info(f"[{bot_name}] Fragmento enviado a {sender_name}: '{fragmento}'")
                 asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, fragmento, "outgoing"))
 
         except Exception as e:
-            logger.error(f"❌ Error procesando mensaje en {bot_name}: {e}", exc_info=True)
+            logger.error(f"Error procesando mensaje en {bot_name}: {e}", exc_info=True)
         finally:
             if redis_client:
                 await redis_client.delete(global_user_lock)
@@ -429,20 +329,20 @@ async def main():
                     bot_name = f"{me.first_name} (@{me.username or 'sin_username'})"
                     ACTIVE_CLIENTS.append({"client": cli, "me": me, "name": bot_name})
                     registrar_event_handler(cli, bot_name, me.id)
-                    logger.info(f"✅ Userbot conectado: {bot_name} [{key}] (ID: {me.id})")
+                    logger.info(f"Userbot conectado: {bot_name} [{key}] (ID: {me.id})")
                 else:
-                    logger.error(f"❌ Sesión inválida en {key}")
+                    logger.error(f"Sesion invalida en {key}")
             except Exception as e:
-                logger.error(f"❌ Error conectando {key}: {e}")
+                logger.error(f"Error conectando {key}: {e}")
 
     if not ACTIVE_CLIENTS:
-        logger.error("❌ Ninguna cuenta de Telegram pudo conectarse.")
+        logger.error("Ninguna cuenta de Telegram pudo conectarse.")
         sys.exit(1)
 
     BOT_POOL = itertools.cycle(ACTIVE_CLIENTS)
     print("\n" + "=" * 60)
-    print(f"🚀 ¡Motor activo con {len(ACTIVE_CLIENTS)} Userbots rotando exitosamente!")
-    print(f"🛡️ IDs protegidos por filtro anti-loop: {MY_BOT_IDS}")
+    print(f"¡Motor activo con {len(ACTIVE_CLIENTS)} Userbots rotando exitosamente!")
+    print(f"IDs protegidos por filtro anti-loop: {MY_BOT_IDS}")
     print("=" * 60 + "\n")
 
     await asyncio.gather(*(c["client"].run_until_disconnected() for c in ACTIVE_CLIENTS))
@@ -451,4 +351,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("👋 Detenido.")
+        print("Detenido.")
