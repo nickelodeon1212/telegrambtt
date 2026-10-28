@@ -259,37 +259,41 @@ async def health_check():
 
 def registrar_event_handler(client, bot_name, bot_id):
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    async def handler(event):
+    async def handler(event, current_cli=client):
+        # 1. AISLAMIENTO ESTRICTO: Si el evento no proviene del cliente dueño de esta función, descartar inmediatamente
+        if event.client != current_cli:
+            return
+
         sender = await event.get_sender()
         sender_id = event.sender_id
         message_id = event.id
 
-        # 1. Ignorar mensajes propios
+        # 2. Ignorar si el remitente es uno de nuestros bots
         if sender_id in MY_BOT_IDS:
             return
 
         if not sender or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
             return
 
-        # 🛡️ 2. FILTRO ESTRICTO DE AISLAMIENTO: Asegurar que este evento pertenece específicamente a ESTE cliente
-        # (Evita que las 9 sesiones procesen el mismo mensaje entrante de forma cruzada)
-        try:
-            me_client = await client.get_me()
-            if me_client.id != bot_id:
-                return
-        except Exception:
-            pass
-
         texto = event.raw_text
         if not texto:
             return
 
-        # 3. 🛡️ BLOQUEO ATÓMICO EN REDIS (Anti-duplicados por ID de mensaje)
+        # 3. 🛡️ BLOQUEO EN REDIS ANTI-DUPLICADOS (Por usuario y por mensaje)
+        user_lock_key = f"user:processing:{sender_id}"
+        msg_dedup_key = f"dedup:msg:{bot_id}:{sender_id}:{message_id}"
+
         if redis_client:
-            dedup_key = f"dedup:msg:{bot_id}:{sender_id}:{message_id}"
-            is_new = await redis_client.set(dedup_key, "processed", nx=True, ex=15)
-            if not is_new:
-                logger.info(f"🚫 [{bot_name}] Mensaje duplicado descartado (ID: {message_id})")
+            # Descartar mensaje duplicado idéntico
+            is_new_msg = await redis_client.set(msg_dedup_key, "1", nx=True, ex=20)
+            if not is_new_msg:
+                logger.info(f"🚫 [{bot_name}] Mensaje duplicado ya registrado (ID: {message_id}). Omitiendo.")
+                return
+
+            # Lock global por usuario: Evita que dos bots o hilos le respondan al mismo usuario en simultáneo
+            acquired_user_lock = await redis_client.set(user_lock_key, str(bot_id), nx=True, ex=30)
+            if not acquired_user_lock:
+                logger.info(f"🔒 [{bot_name}] El usuario {sender_id} ya tiene una respuesta en proceso por otro bot. Omitiendo.")
                 return
 
         sender_name = getattr(sender, "first_name", "Usuario")
@@ -298,11 +302,13 @@ def registrar_event_handler(client, bot_name, bot_id):
 
         if HUMAN_PAUSED_USERS.get(sender_id, False):
             logger.info(f"🤫 IA omitida para {sender_id} (Modo Agente Humano activo).")
+            if redis_client:
+                await redis_client.delete(user_lock_key)
             return
 
         try:
-            # Delay para testeo ágil
-            delay_lectura = random.uniform(5.0, 10.0)
+            # Delay corto y natural
+            delay_lectura = random.uniform(4.0, 8.0)
             logger.info(f"⏳ [{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
 
@@ -316,15 +322,19 @@ def registrar_event_handler(client, bot_name, bot_id):
 
                 tiempo_tipeo = max(2.0, min(len(fragmento) * 0.08 + random.uniform(0.5, 1.5), 5.0))
                 
-                async with client.action(event.chat_id, "typing"):
+                async with current_cli.action(event.chat_id, "typing"):
                     await asyncio.sleep(tiempo_tipeo)
 
-                await client.send_message(event.chat_id, fragmento)
+                await current_cli.send_message(event.chat_id, fragmento)
                 logger.info(f"📤 [{bot_name}] Fragmento enviado a {sender_name}: '{fragmento}'")
                 asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, fragmento, "outgoing"))
 
         except Exception as e:
             logger.error(f"❌ Error procesando mensaje en {bot_name}: {e}", exc_info=True)
+        finally:
+            # Liberar lock del usuario al terminar de enviar
+            if redis_client:
+                await redis_client.delete(user_lock_key)
 
 # ==========================================
 # MAIN
