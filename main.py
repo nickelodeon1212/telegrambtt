@@ -90,7 +90,7 @@ async def obtener_historial_redis(sender_id: int) -> list:
         return []
 
 async def guardar_en_redis(sender_id: int, rol: str, contenido: str):
-    """Guarda un mensaje en el historial de Redis con TTL de 2 horas."""
+    """Guarda un mensaje en el historial de Redis con TTL de 48 horas (172800 segundos)."""
     if not redis_client:
         return
     try:
@@ -98,7 +98,8 @@ async def guardar_en_redis(sender_id: int, rol: str, contenido: str):
         item = json.dumps({"role": rol, "content": contenido})
         await redis_client.rpush(key, item)
         await redis_client.ltrim(key, -10, -1)
-        await redis_client.expire(key, 7200)
+        # 48 Horas de TTL para outbound
+        await redis_client.expire(key, 172800)
     except Exception as e:
         logger.error(f"Error guardando en Redis: {e}")
 
@@ -170,9 +171,17 @@ async def enviar_a_chatwoot(sender_id: str, sender_name: str, message_text: str,
         logger.error(f"Error al sincronizar con Chatwoot: {e}")
 
 async def consultar_ia_con_memoria(sender_id: int, mensaje: str) -> str:
-    """Procesa consultas con OpenAI inyectando el historial reciente de Redis."""
+    """Procesa consultas con OpenAI inyectando historial y aplicando límite de mensajes (Handoff)."""
     system_prompt = cargar_system_prompt()
     historial = await obtener_historial_redis(sender_id)
+
+    # Límite de respuestas automáticas del bot antes de ceder el control a humano en Chatwoot
+    respuestas_bot = [h for h in historial if h.get("role") == "assistant"]
+    LIMITE_RESPUESTAS_BOT = 4
+
+    if len(respuestas_bot) >= LIMITE_RESPUESTAS_BOT:
+        logger.info(f"[{sender_id}] Límite de {LIMITE_RESPUESTAS_BOT} respuestas alcanzado. Pausando bot para handoff.")
+        return None
 
     messages = [{"role": "system", "content": system_prompt}]
     for h in historial:
@@ -270,12 +279,17 @@ def registrar_event_handler(client, bot_name, bot_id):
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
         try:
-            # Delay de lectura más natural y humano (4 a 10 segundos)
+            # Delay de lectura humano (4 a 10 segundos)
             delay_lectura = random.uniform(4.0, 10.0)
             logger.info(f"[{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
 
             respuesta_raw = await consultar_ia_con_memoria(sender_id, texto)
+            
+            # Si superó el límite de respuestas, el bot se calla para el handoff humano
+            if respuesta_raw is None:
+                logger.info(f"[{bot_name}] Límite alcanzado. Silenciando bot para intervención humana en Chatwoot.")
+                return
             
             fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
 
