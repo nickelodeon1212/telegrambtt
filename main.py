@@ -270,7 +270,8 @@ def registrar_event_handler(client, bot_name, bot_id):
         asyncio.create_task(enviar_a_chatwoot(str(sender_id), sender_name, texto, "incoming"))
 
         try:
-            delay_lectura = random.uniform(3.0, 6.0)
+            # Delay de lectura más natural y humano (4 a 10 segundos)
+            delay_lectura = random.uniform(4.0, 10.0)
             logger.info(f"[{bot_name}] Esperando {int(delay_lectura)}s antes de responder a {sender_name}...")
             await asyncio.sleep(delay_lectura)
 
