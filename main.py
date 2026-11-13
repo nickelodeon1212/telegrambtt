@@ -261,7 +261,7 @@ def registrar_event_handler(client, bot_name, bot_id):
         if not texto:
             return
 
-        # Bloqueo global unico en Redis
+        # Bloqueo global atómico en Redis (con TTL y sin delete manual en finally para evitar race conditions)
         global_user_lock = f"lock:global:user:{sender_id}"
         global_msg_dedup = f"dedup:global:msg:{sender_id}:{message_id}"
 
@@ -270,7 +270,7 @@ def registrar_event_handler(client, bot_name, bot_id):
             if not is_new_msg:
                 return
 
-            acquired_lock = await redis_client.set(global_user_lock, str(bot_id), nx=True, ex=45)
+            acquired_lock = await redis_client.set(global_user_lock, str(bot_id), nx=True, ex=30)
             if not acquired_lock:
                 return
 
@@ -309,9 +309,6 @@ def registrar_event_handler(client, bot_name, bot_id):
 
         except Exception as e:
             logger.error(f"Error procesando mensaje en {bot_name}: {e}", exc_info=True)
-        finally:
-            if redis_client:
-                await redis_client.delete(global_user_lock)
 
 # ==========================================
 # MAIN
