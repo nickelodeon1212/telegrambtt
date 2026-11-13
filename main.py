@@ -291,7 +291,8 @@ def registrar_event_handler(client, bot_name, bot_id):
                 logger.info(f"[{bot_name}] Límite alcanzado. Silenciando bot para intervención humana en Chatwoot.")
                 return
             
-            fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()]
+            # Corte estricto a máximo 2 fragmentos para evitar "ametrallamiento" de mensajes
+            fragmentos = [f.strip() for f in respuesta_raw.split("||") if f.strip()][:2]
 
             for index, fragmento in enumerate(fragmentos):
                 if index > 0:
